@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+python-multipart
+pymupdf
+easyocr
+numpy
+Pillow
+opencv-python
+pytesseract
+pydantic
+flask-cors  # Just in case, but we'll use fastapi's CORS
