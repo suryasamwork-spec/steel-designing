@@ -111,31 +111,46 @@ async def extract_text(
         std_text = " ".join([w[4] for w in text_instances])
         
         # Convert crop to image for OCR
-        pix = page.get_pixmap(clip=rect, matrix=fitz.Matrix(3, 3)) # High res for OCR
+        # High DPI: Scale 6.0 ~ 432 DPI (Extra detail for distinguishing similar numbers)
+        pix = page.get_pixmap(clip=rect, matrix=fitz.Matrix(6, 6)) 
         img_data = pix.tobytes("png")
         
         # Image Processing
-        original_pil = Image.open(io.BytesIO(img_data)).convert('L')
+        original_pil = Image.open(io.BytesIO(img_data)).convert('L') # Grayscale
         original_cv = np.array(original_pil)
         
+        # 1. Sharpening Filter (helps define edges for digits like 2, 3, 5, 6)
+        kernel_sharpen = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
+        img_sharpened = cv2.filter2D(original_cv, -1, kernel_sharpen)
+        
+        # 2. Adaptive Thresholding (use sharpened image)
+        # Block Size: 21 (Larger block for smoother background), C: 4
+        img_adaptive = cv2.adaptiveThreshold(
+            img_sharpened, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 21, 4
+        )
+        
+        # Debug: Save processed image if needed (uncomment for local debug)
+        # cv2.imwrite("debug_ocr_input.png", img_adaptive)
+
         reader = get_ocr_reader()
         
-        # Pass 1: Sharpened
-        img_sharpened = original_pil.filter(ImageFilter.SHARPEN)
-        res1 = reader.readtext(np.array(img_sharpened), allowlist='0123456789()[]-"\' .', detail=1)
+        # Pass 1: Sharpened Grayscale (Clean native look)
+        allowlist_chars = '0123456789()[]{}-"\' .kKlIOoSsZzBWwxX|'
+        res1 = reader.readtext(img_sharpened, allowlist=allowlist_chars, detail=1)
+        all_ocr_results = list(res1)
         
-        # Pass 2: Dilated (for thin bracket lines)
-        img_inv = cv2.bitwise_not(original_cv)
+        # Pass 2: Adaptive Threshold (Binarized look)
+        res2 = reader.readtext(img_adaptive, allowlist=allowlist_chars, detail=1)
+        all_ocr_results.extend(res2)
+        
+        # Pass 3: Light Dilation (Helps with thin/faint lines) 
+        img_inv = cv2.bitwise_not(img_adaptive)
         img_dilated = cv2.dilate(img_inv, np.ones((2,2), np.uint8), iterations=1)
         img_final = cv2.bitwise_not(img_dilated)
-        res2 = reader.readtext(img_final, allowlist='0123456789()[]-"\' .', detail=1)
-        
-        # Merged OCR results collection
-        all_ocr_results = []
-        all_ocr_results.extend(res1)  # Sharpened
-        all_ocr_results.extend(res2)  # Dilated
-        
-        # Rotation Helpers
+        res3 = reader.readtext(img_final, allowlist=allowlist_chars, detail=1)
+        all_ocr_results.extend(res3)
+
+        # Pass 3 & 4: Rotated (Helps with vertical text)
         def map_bbox(bbox, rotation, w, h):
             new_bbox = []
             for [x, y] in bbox:
@@ -149,98 +164,153 @@ async def extract_text(
 
         h, w = original_cv.shape
         
-        # Pass 3: Rotated (90 degrees)
         img_90 = cv2.rotate(img_final, cv2.ROTATE_90_CLOCKWISE)
-        res_90 = reader.readtext(img_90, allowlist='0123456789()[]-"\' .', detail=1)
+        res_90 = reader.readtext(img_90, allowlist=allowlist_chars, detail=1)
         all_ocr_results.extend([(map_bbox(b, 90, w, h), t, c) for (b, t, c) in res_90])
 
-        # Pass 4: Rotated (270 degrees)
         img_270 = cv2.rotate(img_final, cv2.ROTATE_90_COUNTERCLOCKWISE)
-        res_270 = reader.readtext(img_270, allowlist='0123456789()[]-"\' .', detail=1)
+        res_270 = reader.readtext(img_270, allowlist=allowlist_chars, detail=1)
         all_ocr_results.extend([(map_bbox(b, 270, w, h), t, c) for (b, t, c) in res_270])
         
         extracted_texts = []
         seen_results = [] 
         
+        # Typo Correction Map
+        char_map = {
+            'k': '1', 'K': '1', 'l': '1', 'I': '1', '|': '1',
+            'O': '0', 'o': '0', 'D': '0', 'Q': '0',
+            'S': '5', 's': '5',
+            'Z': '2', 'z': '2',
+            'B': '8',
+            '{': '(', '}': ')', 
+            # STRICT CHANGE: Unmap [] so they are NOT converted to ()
+            # '[': '(', ']': ')' 
+        }
+        
         for (bbox, text_val, conf) in all_ocr_results:
             clean_t = text_val.strip()
             if len(clean_t) < 1: continue
             
-            norm_t = clean_t.replace('|', '(').replace('{', '(').replace('}', ')')
-            norm_t = re.sub(r'\s+', '', norm_t)
+            # 1. Apply Character Mapping
+            norm_t = ""
+            for char in clean_t:
+                norm_t += char_map.get(char, char)
+            
+            # 2. Normalize Spacing (remove all spaces for de-duplication)
+            # We will use a spaced version for the final string though
+            dedupe_key = re.sub(r'\s+', '', norm_t)
             
             cx = sum(p[0] for p in bbox) / 4
             cy = sum(p[1] for p in bbox) / 4
             
             is_dupe = False
-            for (s_text, s_cx, s_cy) in seen_results:
-                if s_text == norm_t:
+            for (s_key, s_cx, s_cy) in seen_results:
+                if s_key == dedupe_key:
                     dist = ((cx - s_cx)**2 + (cy - s_cy)**2)**0.5
                     if dist < 20: 
                         is_dupe = True
                         break
             
             if not is_dupe:
-                print(f"DEBUG - New OCR Result: '{norm_t}' at ({cx:.1f}, {cy:.1f})")
-                seen_results.append((norm_t, cx, cy))
+                print(f"DEBUG - New OCR Result: '{clean_t}' -> '{norm_t}' at ({cx:.1f}, {cy:.1f})")
+                seen_results.append((dedupe_key, cx, cy))
                 extracted_texts.append(norm_t)
 
-        combined_text = std_text + " " + "  ".join(extracted_texts) + " "
-        combined_text = re.sub(r'\s+', ' ', combined_text) 
-        print(f"DEBUG - Final Combined Text: {combined_text}")
+        # ---------------------------------------------------------
+        # SPATIAL EXTRACTION LOGIC (Per User Request)
+        # ---------------------------------------------------------
         
-        pattern_stud_label = r'([Ww]?\d+x\d+)\s*[\(\[\|]\s*(\d+)\s*[\)\]\|]'
+        # Regexes
+        regex_beam = re.compile(r'([Ww]\d+[xX]\d+)', re.IGNORECASE)
+        regex_bracket = re.compile(r'\[\s*(\d+)\s*\]') # Strict Square Brackets
+
+        beams = []
+        candidates = []
+
+        for (bbox, text_val, conf) in all_ocr_results:
+            clean_t = text_val.strip()
+            
+            # fix common typos in clean_t before regex
+            # e.g. 'W12x14' often read as 'W12x14' (correct) but sometimes 'W12x1A'
+            # For now, rely on strict regex, but normalize spaces
+            clean_t_nospace = re.sub(r'\s+', '', clean_t)
+            
+            # Check for Beam Label
+            beam_match = regex_beam.search(clean_t_nospace)
+            if beam_match:
+                # Calculate Centroid
+                cx = sum(p[0] for p in bbox) / 4
+                cy = sum(p[1] for p in bbox) / 4
+                label = beam_match.group(1).upper()
+                beams.append({'label': label, 'cx': cx, 'cy': cy, 'bbox': bbox})
+                continue # Don't double count as a candidate
+
+            # Check for Square Bracket Value
+            # We use the spaced 'clean_t' here to allow '[ 12 ]'
+            # Also apply char map to fix 'l' -> '1', 'O' -> '0' inside brackets?
+            # Let's do a local cleanup for candidate check
+            mapped_t = ""
+            for char in clean_t:
+                mapped_t += char_map.get(char, char)
+            
+            brack_match = regex_bracket.search(mapped_t)
+            if brack_match:
+                val = int(brack_match.group(1))
+                if 6 <= val <= 60: # Strict Range
+                    cx = sum(p[0] for p in bbox) / 4
+                    cy = sum(p[1] for p in bbox) / 4
+                    candidates.append({'val': val, 'cx': cx, 'cy': cy})
+
+        # Linking Phase
+        # For each candidate, find the NEAREST beam label.
+        # Threshold: How far can a label be? 
+        # At 6.0 scale, text is large. Let's say ~300-400px is reasonable for "associated"
+        # but sometimes it's far. Let's try 1500px diagonal max (generous but keeps locality).
         
-        elevations = []
-        pattern_elevation = r'[\[\(\{]\s*([^\]\)\}]*?[\d"\']+[^\]\)\}]*?)\s*[\]\)\}]'
-        potential_elevations = re.findall(pattern_elevation, combined_text)
-        for match in potential_elevations:
-            clean_match = match.strip()
-            if any(char.isdigit() for char in clean_match):
-                elevations.append(clean_match)
+        MAX_DIST = 1500 
         
         studs = []
-        profiles = {} # Dictionary to store beam profiles: { "W12x19": [18, 29, 11] }
-
-        # Find all stud labels: Beam(Count)
-        matches = re.findall(pattern_stud_label, combined_text)
+        profiles = {}
         total_studs = 0
         sum_bracketed_values = 0
 
-        for beam, val in matches:
-            v_int = int(val)
-            print(f"✅ Match (Label): {beam}({v_int})")
-            studs.append(v_int)
-            total_studs += 1
-            sum_bracketed_values += v_int
+        for cand in candidates:
+            best_beam = None
+            min_dist = float('inf')
             
-            # Store in profiles
-            if beam not in profiles:
-                profiles[beam] = []
-            profiles[beam].append(v_int)
-        
-        # Fallback: if we found no labels but found brackets with numbers, maybe the beam label was far
-        if not studs:
-            pattern_isolated_brackets = r'[\(\[\|]\s*(\d+)\s*[\)\]\|]'
-            potential_studs = re.findall(pattern_isolated_brackets, combined_text)
-            for val in potential_studs:
-                v_int = int(val)
-                if val.isdigit() and v_int < 100: 
-                    print(f"✅ Match (Isolated): ({v_int})")
-                    studs.append(v_int)
-                    sum_bracketed_values += v_int
-                    total_studs += 1
-                else:
-                    print(f"⚠️ Reject (Isolated Too Large/Non-Digit): ({val})")
+            for beam in beams:
+                dist = ((cand['cx'] - beam['cx'])**2 + (cand['cy'] - beam['cy'])**2)**0.5
+                if dist < min_dist:
+                    min_dist = dist
+                    best_beam = beam
+            
+            if best_beam and min_dist <= MAX_DIST:
+                # Associated!
+                b_label = best_beam['label']
+                val = cand['val']
+                
+                print(f"✅ Linked [{val}] to {b_label} (dist: {min_dist:.1f})")
+                
+                studs.append(val)
+                total_studs += 1
+                sum_bracketed_values += val
+                
+                if b_label not in profiles:
+                    profiles[b_label] = []
+                profiles[b_label].append(val)
+            else:
+                print(f"⚠️ Ignored Isolated [{cand['val']}] - Nearest Beam dist: {min_dist:.1f}")
 
+        print(f"DEBUG - Final Spatial Profiles: {profiles.keys()}")
+        
         return {
             "success": True,
-            "elevations": list(set(elevations)),
+            "elevations": list(set(elevations)), # (Legacy, mostly empty now)
             "studs": studs,
             "profiles": profiles,
             "studs_total": sum_bracketed_values,
             "studs_count": total_studs,
-            "raw_text": combined_text
+            "raw_text": "" # No longer relevant in spatial mode
         }
 
     except Exception as e:

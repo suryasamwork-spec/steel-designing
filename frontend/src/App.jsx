@@ -2,13 +2,15 @@ import React, { useState, useRef, useEffect } from 'react';
 import { Stage, Layer, Image as KonvaImage, Rect, Line, Text, Group } from 'react-konva';
 import { Upload, Ruler, Target, Trash2, ChevronLeft, ChevronRight, FileText, Calculator, RotateCcw } from 'lucide-react';
 import { renderPage, extractText } from './api';
+import PresetScalePanel from './components/calibration/PresetScalePanel';
+import CustomScalePanel from './components/calibration/CustomScalePanel';
 
 const App = () => {
     const [file, setFile] = useState(null);
     const [pageImage, setPageImage] = useState(null);
     const [pageNum, setPageNum] = useState(0);
     const [zoom, setZoom] = useState(2.0);
-    const [mode, setMode] = useState('select'); // 'select', 'calibrate', 'measure'
+    const [mode, setMode] = useState('select'); // 'select', 'calibrate'
     const [scale, setScale] = useState(1.0);
 
     // Selection state
@@ -17,9 +19,38 @@ const App = () => {
     const [isDragging, setIsDragging] = useState(false);
 
     // Calibration state
+    const [calibrationMode, setCalibrationMode] = useState('custom'); // 'preset' | 'custom'
     const [calibrationPoints, setCalibrationPoints] = useState([]);
-    const [pixelsPerUnit, setPixelsPerUnit] = useState(null);
+    const [scaleFactor, setScaleFactor] = useState(null); // { x: number, y: number } or null
     const [unitLabel, setUnitLabel] = useState('ft');
+    const [precision, setPrecision] = useState(2);
+
+    // Coordinate Conversion Helper
+    // PDF coordinates = Image Pixels / Render Zoom (2.0)
+    const RENDER_ZOOM = 2.0;
+
+    const toPDF = (imagePx) => {
+        return imagePx / RENDER_ZOOM;
+    };
+
+    const formatLength = (imagePxX, imagePxY) => {
+        // If passed as single value, treat as length along X or generic length?
+        // Let's assume hypotenuse if both provided, otherwise single dimension
+        if (!scaleFactor) {
+            const dist = Math.sqrt(imagePxX * imagePxX + imagePxY * imagePxY);
+            return `${Math.round(dist)} px`;
+        }
+
+        // Apply scale factors separately to PDF coordinates
+        const pdfX = toPDF(imagePxX);
+        const pdfY = toPDF(imagePxY);
+
+        const realX = pdfX * scaleFactor.x;
+        const realY = pdfY * scaleFactor.y;
+
+        const realDist = Math.sqrt(realX * realX + realY * realY);
+        return `${realDist.toFixed(precision)} ${unitLabel}`;
+    };
 
     // OCR Results
     const [results, setResults] = useState({ elevations: [], total: 0, studsLabelCount: 0, profiles: {} });
@@ -100,13 +131,21 @@ const App = () => {
         setScale(1.0);
     };
 
+    const getPointerPos = (stage) => {
+        const pointer = stage.getPointerPosition();
+        return {
+            x: pointer.x / scale,
+            y: pointer.y / scale
+        };
+    };
+
     const handleMouseDown = (e) => {
         if (mode === 'select') {
-            const pos = e.target.getStage().getRelativePointerPosition();
+            const pos = getPointerPos(e.target.getStage());
             setNewSelection({ startX: pos.x, startY: pos.y, currentX: pos.x, currentY: pos.y });
             setIsDragging(true);
-        } else if (mode === 'calibrate' && calibrationPoints.length < 2) {
-            const pos = e.target.getStage().getRelativePointerPosition();
+        } else if (mode === 'calibrate' && calibrationMode === 'custom' && calibrationPoints.length < 2) {
+            const pos = getPointerPos(e.target.getStage());
             setCalibrationPoints([...calibrationPoints, pos]);
         }
     };
@@ -115,6 +154,7 @@ const App = () => {
         if (!newSelection || !isDragging || mode !== 'select') return;
         const stage = e.target.getStage();
         const pos = stage.getRelativePointerPosition();
+
         setNewSelection({
             ...newSelection,
             currentX: pos.x,
@@ -147,9 +187,6 @@ const App = () => {
 
         setAppLoading(true);
         try {
-            // Because selections are already in 'image space' thanks to getRelativePointerPosition,
-            // we don't need to divide by 'scale'.
-            // However, we DO need to divide by the backend render 'zoom' factor to get original PDF coordinates.
             const pdfX = x / zoom;
             const pdfY = y / zoom;
             const pdfW = width / zoom;
@@ -169,8 +206,6 @@ const App = () => {
                         if (!newProfiles[beam]) {
                             newProfiles[beam] = [];
                         }
-                        // Add unique values only? Or all? User said "store like - W12x19(18)... (29)... (11)"
-                        // Assuming we want to accumulate all found values for that beam type.
                         newProfiles[beam] = [...newProfiles[beam], ...values];
                     });
                 }
@@ -200,20 +235,20 @@ const App = () => {
     const startCalibration = () => {
         setMode('calibrate');
         setCalibrationPoints([]);
+        // Keep existing scale if any
     };
 
-    useEffect(() => {
-        if (calibrationPoints.length === 2) {
-            const [p1, p2] = calibrationPoints;
-            const dist = Math.sqrt(Math.pow(p2.x - p1.x, 2) + Math.pow(p2.y - p1.y, 2));
-            const val = prompt("Enter the real-world distance (e.g., 2 for 2ft):");
-            if (val) {
-                setPixelsPerUnit(dist / parseFloat(val));
-                alert(`Scale set: ${dist.toFixed(2)}px = ${val}${unitLabel}`);
-            }
-            setMode('select');
-        }
-    }, [calibrationPoints]);
+    const onApplyScale = (newScale) => {
+        // newScale is { x, y, unit }
+        console.log("Applying Scale:", newScale);
+        setScaleFactor({ x: newScale.x, y: newScale.y });
+        setUnitLabel(newScale.unit || 'ft');
+    };
+
+    const resetCalibration = () => {
+        setScaleFactor(null);
+        setCalibrationPoints([]);
+    };
 
     return (
         <div className="flex flex-col h-screen w-full bg-slate-900 text-slate-100 overflow-hidden">
@@ -280,96 +315,167 @@ const App = () => {
                         </div>
                     </section>
 
-                    {/* Statistics */}
-                    <section className="bg-slate-900/50 rounded-xl p-4 border border-slate-700">
-                        <h2 className="text-xs font-semibold text-slate-500 uppercase tracking-widest mb-4 flex items-center justify-between">
-                            Extracted Data
-                            <div className="flex gap-2">
-                                <button onClick={clearResults} className="hover:text-red-400 transition-colors" title="Clear all results">
-                                    <Trash2 size={14} />
-                                </button>
-                                <Calculator size={14} />
-                            </div>
-                        </h2>
-                        <div className="space-y-4">
-                            <div className="flex justify-between items-end">
-                                <span className="text-slate-400 text-sm">Total Studs (Sum):</span>
-                                <span className="text-3xl font-bold text-primary-400 leading-none">{results.total}</span>
-                            </div>
-                            <div className="flex justify-between items-center text-sm">
-                                <span className="text-slate-400">Beam Labels Count:</span>
-                                <span className="text-slate-200 font-mono">{results.studsLabelCount || 0}</span>
-                            </div>
+                    {/* Dynamic Sidebar Content */}
 
-                            {/* Profiles Section */}
-                            {results.profiles && Object.keys(results.profiles).length > 0 && (
-                                <div className="pt-4 border-t border-slate-700">
-                                    <span className="text-slate-400 text-xs block mb-2 uppercase group-hover:text-primary-400 transition-colors">Profiles</span>
-                                    <div className="space-y-3">
-                                        {Object.entries(results.profiles).map(([beam, values]) => (
-                                            <div key={beam} className="bg-slate-800 rounded-lg p-3 border border-slate-700">
-                                                <div className="text-primary-400 font-bold text-sm mb-2 border-b border-slate-700 pb-1 flex justify-between">
-                                                    {beam}
-                                                    <span className="text-xs text-slate-500 font-normal">{values.length} items</span>
-                                                </div>
-                                                <div className="flex flex-wrap gap-2">
-                                                    {values.map((val, idx) => (
-                                                        <span key={idx} className="px-2 py-0.5 bg-slate-900 rounded text-xs border border-slate-700 text-slate-300">
-                                                            ({val})
-                                                        </span>
-                                                    ))}
+                    {/* SELECTION MODE PANEL */}
+                    {mode === 'select' && (
+                        <>
+                            {/* Statistics */}
+                            <section className="bg-slate-900/50 rounded-xl p-4 border border-slate-700 shadow-sm">
+                                <h2 className="text-xs font-semibold text-slate-500 uppercase tracking-widest mb-4 flex items-center justify-between">
+                                    Extracted Data
+                                    <div className="flex gap-2">
+                                        <button onClick={clearResults} className="hover:text-red-400 transition-colors" title="Clear all results">
+                                            <Trash2 size={14} />
+                                        </button>
+                                        <Calculator size={14} />
+                                    </div>
+                                </h2>
+                                <div className="space-y-4">
+                                    <div className="flex justify-between items-end">
+                                        <span className="text-slate-400 text-sm">Total Studs (Sum):</span>
+                                        <span className="text-3xl font-bold text-primary-400 leading-none">{results.total}</span>
+                                    </div>
+                                    <div className="flex justify-between items-center text-sm">
+                                        <span className="text-slate-400">Beam Labels Count:</span>
+                                        <span className="text-slate-200 font-mono">{results.studsLabelCount || 0}</span>
+                                    </div>
+
+                                    {/* Profiles Section */}
+                                    {results.profiles && Object.keys(results.profiles).length > 0 && (
+                                        <div className="pt-4 border-t border-slate-700">
+                                            <span className="text-slate-400 text-xs block mb-2 uppercase group-hover:text-primary-400 transition-colors">Profiles</span>
+                                            <div className="space-y-3">
+                                                {Object.entries(results.profiles).map(([beam, values]) => (
+                                                    <div key={beam} className="bg-slate-800 rounded-lg p-3 border border-slate-700">
+                                                        <div className="text-primary-400 font-bold text-sm mb-2 border-b border-slate-700 pb-1 flex justify-between">
+                                                            {beam}
+                                                            <span className="text-xs text-slate-500 font-normal">{values.length} items</span>
+                                                        </div>
+                                                        <div className="flex flex-wrap gap-2">
+                                                            {values.map((val, idx) => (
+                                                                <span key={idx} className="px-2 py-0.5 bg-slate-900 rounded text-xs border border-slate-700 text-slate-300">
+                                                                    ({val})
+                                                                </span>
+                                                            ))}
+                                                        </div>
+                                                    </div>
+                                                ))}
+                                            </div>
+                                        </div>
+                                    )}
+                                    <div className="pt-4 border-t border-slate-700">
+                                        <span className="text-slate-400 text-xs block mb-2 uppercase">Elevations:</span>
+                                        <div className="flex flex-wrap gap-2">
+                                            {results.elevations.map((el, i) => (
+                                                <span key={i} className="px-2 py-1 bg-slate-700 rounded text-xs border border-slate-600">
+                                                    {el}
+                                                </span>
+                                            ))}
+                                            {results.elevations.length === 0 && <span className="text-slate-600 text-xs italic">none found</span>}
+                                        </div>
+                                    </div>
+
+                                    {newSelection && !isDragging && (
+                                        <>
+                                            <div className="text-xs text-center text-slate-400 font-mono mb-2">
+                                                Selection: {formatLength(Math.abs(newSelection.currentX - newSelection.startX), Math.abs(newSelection.currentY - newSelection.startY))}
+                                            </div>
+                                            <button
+                                                onClick={performExtraction}
+                                                className="w-full bg-primary-600 hover:bg-primary-500 text-white py-3 rounded-lg font-bold flex items-center justify-center gap-2 shadow-lg shadow-primary-900/20 transition-all transform active:scale-95"
+                                            >
+                                                <Target size={18} />
+                                                Process Selection
+                                            </button>
+                                        </>
+                                    )}
+                                </div>
+                            </section>
+
+                            {/* History */}
+                            <section className="flex-1 overflow-hidden flex flex-col">
+                                <h2 className="text-xs font-semibold text-slate-500 uppercase tracking-widest mb-3">Snapshot History</h2>
+                                <div className="space-y-2 overflow-y-auto pr-2 custom-scrollbar">
+                                    {selections.map((sel) => (
+                                        <div key={sel.id} className="p-3 bg-slate-700/50 rounded-lg border border-slate-650 group hover:border-primary-500 transition-colors">
+                                            <div className="flex justify-between items-start mb-1">
+                                                <span className="text-[10px] text-slate-500 font-mono">#{sel.id.toString().slice(-4)}</span>
+                                                <button
+                                                    onClick={() => setSelections(selections.filter(s => s.id !== sel.id))}
+                                                    className="text-slate-500 hover:text-red-400 opacity-0 group-hover:opacity-100 transition-opacity"
+                                                >
+                                                    <Trash2 size={12} />
+                                                </button>
+                                            </div>
+                                            <div className="text-xs">
+                                                <span className="text-primary-300 font-medium">{sel.studs.length} studs</span> found
+                                                <div className="text-slate-500 text-[10px] mt-1">
+                                                    {formatLength(sel.width, sel.height)}
                                                 </div>
                                             </div>
-                                        ))}
-                                    </div>
-                                </div>
-                            )}
-                            <div className="pt-4 border-t border-slate-700">
-                                <span className="text-slate-400 text-xs block mb-2 uppercase">Elevations:</span>
-                                <div className="flex flex-wrap gap-2">
-                                    {results.elevations.map((el, i) => (
-                                        <span key={i} className="px-2 py-1 bg-slate-700 rounded text-xs border border-slate-600">
-                                            {el}
-                                        </span>
+                                        </div>
                                     ))}
-                                    {results.elevations.length === 0 && <span className="text-slate-600 text-xs italic">none found</span>}
+                                    {selections.length === 0 && (
+                                        <div className="text-center text-slate-600 py-8 text-sm italic">
+                                            No selections yet
+                                        </div>
+                                    )}
                                 </div>
-                            </div>
+                            </section>
+                        </>
+                    )}
 
-                            {newSelection && !isDragging && (
-                                <button
-                                    onClick={performExtraction}
-                                    className="w-full mt-4 bg-primary-600 hover:bg-primary-500 text-white py-3 rounded-lg font-bold flex items-center justify-center gap-2 shadow-lg shadow-primary-900/20 transition-all transform active:scale-95"
-                                >
-                                    <Target size={18} />
-                                    Process Selection
-                                </button>
-                            )}
-                        </div>
-                    </section>
+                    {/* CALIBRATION MODE PANEL */}
+                    {mode === 'calibrate' && (
+                        <section className="flex-1 flex flex-col gap-6">
+                            <div className="bg-slate-900/50 rounded-xl p-4 border border-slate-700 shadow-sm">
+                                <h2 className="text-xs font-semibold text-slate-500 uppercase tracking-widest mb-4">Calibration</h2>
 
-                    {/* History */}
-                    <section className="flex-1 overflow-hidden flex flex-col">
-                        <h2 className="text-xs font-semibold text-slate-500 uppercase tracking-widest mb-3">Snapshot History</h2>
-                        <div className="space-y-2 overflow-y-auto pr-2">
-                            {selections.map((sel) => (
-                                <div key={sel.id} className="p-3 bg-slate-700/50 rounded-lg border border-slate-650 group hover:border-primary-500 transition-colors">
-                                    <div className="flex justify-between items-start mb-1">
-                                        <span className="text-[10px] text-slate-500 font-mono">#{sel.id.toString().slice(-4)}</span>
+                                {/* Mode Switcher */}
+                                <div className="flex gap-2 mb-4 bg-slate-800 p-1 rounded-lg">
+                                    <button
+                                        onClick={() => setCalibrationMode('preset')}
+                                        className={`flex-1 py-1.5 text-xs font-medium rounded transition-all ${calibrationMode === 'preset' ? 'bg-slate-600 text-white shadow' : 'text-slate-400 hover:text-slate-200'}`}
+                                    >
+                                        Preset
+                                    </button>
+                                    <button
+                                        onClick={() => setCalibrationMode('custom')}
+                                        className={`flex-1 py-1.5 text-xs font-medium rounded transition-all ${calibrationMode === 'custom' ? 'bg-slate-600 text-white shadow' : 'text-slate-400 hover:text-slate-200'}`}
+                                    >
+                                        Custom
+                                    </button>
+                                </div>
+
+                                {calibrationMode === 'preset' ? (
+                                    <PresetScalePanel onApply={onApplyScale} />
+                                ) : (
+                                    <CustomScalePanel
+                                        points={calibrationPoints}
+                                        onSetScale={onApplyScale}
+                                        onResetPoints={() => setCalibrationPoints([])}
+                                        scaleFactor={scaleFactor}
+                                        unitLabel={unitLabel}
+                                        setUnitLabel={setUnitLabel}
+                                        precision={precision}
+                                        setPrecision={setPrecision}
+                                    />
+                                )}
+
+                                {scaleFactor && (
+                                    <div className="mt-4 pt-4 border-t border-slate-700">
                                         <button
-                                            onClick={() => setSelections(selections.filter(s => s.id !== sel.id))}
-                                            className="text-slate-500 hover:text-red-400 opacity-0 group-hover:opacity-100 transition-opacity"
+                                            onClick={resetCalibration}
+                                            className="w-full text-xs text-red-400 hover:text-red-300 border border-red-900/50 hover:bg-red-900/20 py-1.5 rounded transition-colors"
                                         >
-                                            <Trash2 size={12} />
+                                            Reset Calibration
                                         </button>
                                     </div>
-                                    <div className="text-xs">
-                                        <span className="text-primary-300 font-medium">{sel.studs.length} studs</span> found
-                                    </div>
-                                </div>
-                            ))}
-                        </div>
-                    </section>
+                                )}
+                            </div>
+                        </section>
+                    )}
                 </aside>
 
                 {/* Canvas Area */}
@@ -390,7 +496,7 @@ const App = () => {
                         >
                             <ChevronRight size={18} />
                         </button>
-                    </div>
+                    </div >
 
                     <div className="flex-1 overflow-auto canvas-container relative">
                         {loading && (
@@ -439,15 +545,30 @@ const App = () => {
 
                                     {/* Draw Current Selection (Snipping Tool Style) */}
                                     {newSelection && (
-                                        <Rect
-                                            x={Math.min(newSelection.startX, newSelection.currentX)}
-                                            y={Math.min(newSelection.startY, newSelection.currentY)}
-                                            width={Math.abs(newSelection.currentX - newSelection.startX)}
-                                            height={Math.abs(newSelection.currentY - newSelection.startY)}
-                                            stroke="#38bdf8"
-                                            strokeWidth={2}
-                                            fill="rgba(14, 165, 233, 0.2)"
-                                        />
+                                        <Group>
+                                            <Rect
+                                                x={Math.min(newSelection.startX, newSelection.currentX)}
+                                                y={Math.min(newSelection.startY, newSelection.currentY)}
+                                                width={Math.abs(newSelection.currentX - newSelection.startX)}
+                                                height={Math.abs(newSelection.currentY - newSelection.startY)}
+                                                stroke="#38bdf8"
+                                                strokeWidth={2}
+                                                fill="rgba(14, 165, 233, 0.2)"
+                                            />
+                                            <Text
+                                                x={Math.min(newSelection.startX, newSelection.currentX)}
+                                                y={Math.min(newSelection.startY, newSelection.currentY) - 20}
+                                                text={`${formatLength(Math.abs(newSelection.currentX - newSelection.startX), Math.abs(newSelection.currentY - newSelection.startY))}`}
+                                                fill="#38bdf8"
+                                                fontSize={14}
+                                                fontStyle="bold"
+                                                stroke="black"
+                                                strokeWidth={0.5}
+                                                shadowColor="black"
+                                                shadowBlur={4}
+                                                shadowOpacity={0.5}
+                                            />
+                                        </Group>
                                     )}
 
                                     {/* Calibration Visuals */}
@@ -466,12 +587,32 @@ const App = () => {
                                         </Group>
                                     ))}
                                     {calibrationPoints.length === 2 && (
-                                        <Line
-                                            points={[calibrationPoints[0].x, calibrationPoints[0].y, calibrationPoints[1].x, calibrationPoints[1].y]}
-                                            stroke="#ef4444"
-                                            strokeWidth={1}
-                                            dash={[5, 5]}
-                                        />
+                                        <Group>
+                                            <Line
+                                                points={[calibrationPoints[0].x, calibrationPoints[0].y, calibrationPoints[1].x, calibrationPoints[1].y]}
+                                                stroke="#ef4444"
+                                                strokeWidth={1}
+                                                dash={[5, 5]}
+                                            />
+                                            {/* Show current measured distance if scale is set */}
+                                            {scaleFactor && (
+                                                <Text
+                                                    x={(calibrationPoints[0].x + calibrationPoints[1].x) / 2}
+                                                    y={(calibrationPoints[0].y + calibrationPoints[1].y) / 2 - 20}
+                                                    text={formatLength(
+                                                        Math.abs(calibrationPoints[1].x - calibrationPoints[0].x),
+                                                        Math.abs(calibrationPoints[1].y - calibrationPoints[0].y)
+                                                    )}
+                                                    fill="#ef4444"
+                                                    fontSize={14}
+                                                    fontStyle="bold"
+                                                    stroke="white"
+                                                    strokeWidth={0.5}
+                                                    shadowColor="black"
+                                                    shadowBlur={2}
+                                                />
+                                            )}
+                                        </Group>
                                     )}
                                 </Layer>
                             </Stage>
@@ -484,9 +625,9 @@ const App = () => {
                             </div>
                         )}
                     </div>
-                </main>
-            </div>
-        </div>
+                </main >
+            </div >
+        </div >
     );
 };
 
